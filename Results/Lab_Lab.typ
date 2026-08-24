@@ -1,0 +1,32 @@
+#table(
+  columns: (25%, 6%, 10pt, 1fr, 1fr, 10pt, 1fr, 1fr, 10pt, 1fr, 1fr),
+  align: (left, left, center, left, left, center, left, left, center, left, left),
+  stroke: none,
+  table.hline(stroke: 1pt),
+  table.header(
+    table.cell(colspan: 2, align: center)[* *],
+    [],
+    table.cell(colspan: 2, align: center, stroke: (bottom: 0.5pt))[**L\***],
+    [],
+    table.cell(colspan: 2, align: center, stroke: (bottom: 0.5pt))[**a\***],
+    [],
+    table.cell(colspan: 2, align: center, stroke: (bottom: 0.5pt))[**b\***],
+    [Treatment],
+    [n],
+    [],
+    [mean],
+    [SD],
+    [],
+    [mean],
+    [SD],
+    [],
+    [mean],
+    [SD]
+  ),
+  table.hline(stroke: 0.5pt),
+  [-_T.asperellum_\ × -_R.solani_], [10], [], [69.7], [2.02], [], [-25.5], [1.42], [], [28.3], [1.35],
+  [-_T.asperellum_\ × +_R.solani_], [10], [], [70.8], [3.67], [], [-24.8], [2.02], [], [28], [2.94],
+  [+_T.asperellum_\ × -_R.solani_], [10], [], [71.7], [3.02], [], [-25.4], [0.623], [], [28.6], [1.04],
+  [+_T.asperellum_\ × +_R.solani_], [10], [], [69.9], [3.82], [], [-25.2], [1.14], [], [28.7], [1.42],
+  table.hline(stroke: 1pt)
+) 
