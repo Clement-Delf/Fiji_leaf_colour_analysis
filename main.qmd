@@ -1,0 +1,1260 @@
+---
+title: "ColorSpace exploration"
+format: typst
+---
+
+# ============================================================
+# Leaf CIELAB color analysis
+#
+# Processing pipeline for CIELAB histograms exported from
+# Fiji/ImageJ leaf segmentation.
+#
+# Workflow:
+#   1. Import RGB/Lab histogram data and Lab ranges
+#   2. Add experimental design metadata
+#   3. Select the maximum-numbered leaf for each image
+#   4. Normalize pixel histograms to proportions
+#   5. Convert 8-bit histogram bins to original Lab values
+#   6. Compute weighted mean L*, a*, and b* values
+#   7. Calculate pairwise CIEDE2000 color differences
+#   8. Generate plots and summary tables
+#
+# Input files:
+#   - all_Lab_bins.csv : Lab histogram counts exported by Fiji
+#   - Lab_ranges.csv   : original 32-bit Lab ranges for each histogram
+#   - design.csv       : experimental design and treatment metadata
+#
+# Output:
+#   - Results/Plots/ : CIEDE2000 plots
+#   - Results/Tables/ : CIELAB summary tables
+# ============================================================
+
+```{r}
+# Librairies
+# CRAN packages
+pkgs <- c(
+  "tibble", "dplyr", "stringr", "purrr", "ggplot2", "patchwork", "car", "multcomp", "multcompView", "emmeans", "ggpubr", "broom", "tidyr", "here", "farver", "ggtext", "ltc", "typstable"
+)
+
+# Bioconductor packages
+# pkgs_bioc <- c(
+#     ""
+# )
+
+# Installer les packages CRAN si nécessaire
+for (pkg in pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+  suppressPackageStartupMessages(
+    library(pkg, character.only = TRUE)
+    )
+}
+
+# Installer les packages Bioconductor si nécessaire
+# if (!requireNamespace("BiocManager", quietly = TRUE)) {
+#   install.packages("BiocManager")
+# }
+
+# Installer les Bioconductor packages
+# BiocManager::install(pkgs_bioc, update = FALSE, ask = FALSE)
+
+# Charger les Bioconductor packages
+# for (pkg in pkgs_bioc) {
+#   suppressPackageStartupMessages(
+#     library(pkg, character.only = TRUE)
+#   )
+# }
+
+# if (!require('name_github_pkg')) remotes::install_github('repo/pkg')
+# library('pkg_name')
+
+# WD 
+wd <- function(path = NULL) {
+  
+  if (!requireNamespace("here", quietly = TRUE)) {
+    stop("Package 'here' is required. Install it with install.packages('here').")
+  }
+  
+  if (!is.null(path)) {
+    
+    path <- path.expand(path)
+    
+    if (dir.exists(path)) {
+      
+      # définit le projet racine implicitement si possible
+      setwd(normalizePath(path))
+      message("Using path: ", normalizePath(path))
+      return(invisible(path))
+      
+    } else {
+      warning("Path does not exist: ", path)
+    }
+  }
+  
+  choice <- readline(
+    "Directory not found or not provided. Type 'f' (choose folder) or 'c' (current project root): "
+  )
+  
+  choice <- tolower(choice)
+  
+  if (choice == "f") {
+    
+    new_path <- dirname(file.choose())
+    
+    setwd(normalizePath(new_path))
+    message("Selected folder: ", new_path)
+    return(invisible(new_path))
+    
+  } else if (choice == "c") {
+    
+    root <- here::here()
+    setwd(normalizePath(root))
+    message("Using here() project root: ", root)
+    return(invisible(root))
+    
+  } else {
+    stop("Invalid option")
+  }
+}
+
+wd("~/Documents/R/memoire/lab_exploration//")
+
+#=== Colour vision accessibility check
+#ltc_cvd(ploen)                     # normal + deuteranopia / protanopia / tritanopia
+#ltc_cvd("ploen", severity = 0.6) # milder simulation
+
+#ltc_cvd(alger)                     # normal + deuteranopia / protanopia / tritanopia
+#ltc_cvd("alger", severity = 0.6) # milder simulation
+```
+
+```{bash}
+#!/bin/bash
+
+ROOT="/home/seeker/Documents/Mémoire/pictures/exp2_leaves_scan"
+OUT="all_Lab_bins.csv"
+
+# header
+echo "Batch,Image,Leaf,Channel,Bin,Count" > $OUT
+
+for batch in batch1 batch2 batch3 batch4
+do
+    find "$ROOT/$batch/croped/color_corrected" \
+    -type f \
+    -name "*_Lab_*.csv" | while read file
+
+    do
+        # fetch metadata
+        image=$(basename $(dirname $(dirname "$file")))
+        leaf=$(basename $(dirname "$file"))
+        batch_name=$(basename "$batch")
+
+        # fetch which L*, a*, b* channel
+        channel=$(basename "$file" | \
+                  sed -E 's/.*_Lab_([Lab])\.csv/\1/')
+        # remove header and print metadata
+        tail -n +2 "$file" | \
+        awk -F',' \
+        -v b="$batch_name" \
+        -v i="$image" \
+        -v l="$leaf" \
+        -v c="$channel" \
+        '{
+          print b","i","l","c","$1","$2
+        }' >> $OUT
+    done
+done
+
+OUT="Lab_ranges.csv"
+
+# header
+echo "Batch,Image,Leaf,Channel,Header" > $OUT
+
+for batch in batch1 batch2 batch3 batch4
+do
+    find "$ROOT/$batch/croped/color_corrected" \
+    -type f \
+    -name "*_Lab_*.csv" | while read file
+    do
+        # fetch metadata
+        image=$(basename $(dirname $(dirname "$file")))
+        leaf=$(basename $(dirname "$file"))
+        batch_name=$(basename "$batch")
+
+        # fetch which L*, a*, b* channel
+        channel=$(basename "$file" | \
+                  sed -E 's/.*_Lab_([Lab])\.csv/\1/')
+
+        # fetch first line
+        header=$(head -n 1 "$file")
+
+        # remove "," ";" from header
+        header=$(echo "$header" | tr ',' ';')
+        
+        echo "$batch_name,$image,$leaf,$channel,\"$header\"" >> $OUT
+    done
+done
+```
+
+```{r}         
+dir.create("Results", showWarnings = FALSE)
+dir.create("Results/Tables", showWarnings = FALSE)
+dir.create("Results/Plots", showWarnings = FALSE)
+    
+plot_histogram <- function(
+    data,
+    x = "Bin",
+    y = "Count",
+    normalize = TRUE,
+    treatment_colors = NULL,
+    facet_var = NULL,
+    facet_direction = c("rows", "cols"),
+    treatment_labels = NULL,
+    level_labels = NULL,
+    average = TRUE,
+    individuals = TRUE,
+    individual_alpha = 0.3,
+    average_linewidth = 1.5,
+    xlabel = "CIELAB bin"
+){
+  # --- Create Interaction if not already present ---
+  if (!"Interaction" %in% names(data)) {
+  data <- data %>%
+    mutate(Interaction = paste(MicB, MicP, sep=":"))
+  }
+
+  data <- data %>%
+    mutate(
+      Interaction = as.character(Interaction)
+    )
+
+  facet_direction <- match.arg(facet_direction)
+
+  # --- Optional normalization ---
+  if(normalize){
+    data <- data %>%
+      group_by(ID, Interaction) %>%
+      mutate(Prop = .data[[y]] / sum(.data[[y]])) %>%
+      ungroup()
+
+    y <- "Prop"
+    ylabel <- "Proportion"
+
+  }else{
+    ylabel <- y
+  }
+
+  # --- Markdown helpers ---
+  escape_md <- function(x){
+    gsub("([*+_#-])","\\\\\\1",x)
+  }
+
+# --- Escape leading Markdown list/header markers only --- 
+# Markdown interprets leading "-", "+", and "#" as list/header 
+# markers, which can generate unsupported HTML tags in gridtext. 
+# This is required when level_labels contains "-" or "+"
+  escape_leading_md <- function(x){
+    gsub("^([-+#])(?=\\s|$)", "\\\\\\1", x, perl = TRUE)
+  }
+# --- Apply level labels while preserving intentional Markdown --- 
+# Raw values not replaced by level_labels are escaped to prevent 
+# unintended Markdown formatting. # Values explicitly provided through level_labels are kept unchanged 
+# so intentional Markdown, e.g. "*R. solani*", remains active.
+  apply_level_label <- function(x){
+    if(is.null(level_labels))
+      return(x)
+    out <- as.character(x)
+
+    matched <- out %in% names(level_labels)
+
+    out[!matched] <- escape_md(out[!matched])
+    out[matched]  <- level_labels[out[matched]]
+
+    out
+  }
+
+  # --- Determine x-axis variable when faceting ---
+  factors <- strsplit(as.character(unique(data$Interaction)[1]),":")[[1]]
+
+  if (!is.null(facet_var)) {
+
+    if (!is.null(facet_var)) {
+      axis_factor <- setdiff(c("MicB", "MicP"), facet_var)
+
+    } else {
+      axis_factor <- "Interaction"
+    }
+
+    data <- data %>%
+      mutate(
+        .axis_value = .data[[axis_factor]]
+      )
+
+    # Apply level labels to the x-axis
+    data <- data %>%
+      mutate(
+        .axis_value = apply_level_label(.axis_value)
+      )
+
+    # Add the corresponding treatment name
+    axis_suffix <- if (!is.null(treatment_labels) &&
+                      axis_factor %in% names(treatment_labels)) {
+      treatment_labels[[axis_factor]]
+    } else {
+      ""
+    }
+    data <- data %>%
+      mutate(
+        .axis_label =
+          paste0(
+            .axis_value,
+            ifelse(axis_suffix == "",
+                  "",
+                  paste0(" ", axis_suffix))
+          )
+      ) %>%
+      mutate(.axis_label = escape_leading_md(.axis_label))
+    x_aes_var <- ".axis_label"
+
+  } else {
+    x_aes_var <- "Interaction"
+  }
+
+  # --- Plot ---
+  p <-
+    ggplot(
+      data,
+      aes(
+        x = .data[[x]],
+        y = .data[[y]],
+        colour = Interaction
+      )
+    )
+
+  # --- Individual profiles ---
+  if(individuals){
+    p <- p +
+      geom_line(
+        aes(group=ID),
+        alpha=individual_alpha
+      )
+  }
+  # --- Mean profile ---
+  if(average){
+    p <- p +
+      stat_summary(
+        aes(group=Interaction),
+        fun=mean,
+        geom="line",
+        linewidth=average_linewidth
+      )
+  }
+
+  # --- Treatment colours ---
+  if(!is.null(treatment_colors)){
+    p <- p+
+      scale_colour_manual(values=treatment_colors)
+  }
+
+  # --- Faceting ---
+  if(!is.null(facet_var)){
+    facet_levels_raw <- unique(as.character(data[[facet_var]]))
+    facet_levels_display <- apply_level_label(facet_levels_raw)
+
+    if(!is.null(treatment_labels) &&
+       facet_var %in% names(treatment_labels)){
+
+      facet_labeller <-
+        setNames(
+          escape_leading_md(
+            paste0(
+              facet_levels_display,
+              " ",
+              treatment_labels[[facet_var]]
+            )
+          ),
+          facet_levels_raw
+        )
+
+    }else{
+      facet_labeller <-
+        setNames(
+          escape_leading_md(facet_levels_display),
+          facet_levels_raw
+        )
+
+    }
+    # Apply the requested facet orientation
+    if(facet_direction=="rows"){
+      p <- p +
+        facet_grid(
+          rows=vars(.data[[facet_var]]),
+          labeller=labeller(.rows=facet_labeller)
+        )
+
+    }else{
+      p <- p +
+        facet_grid(
+          cols=vars(.data[[facet_var]]),
+          labeller=labeller(.cols=facet_labeller)
+        )
+    }
+  }
+
+  # --- Plot style ---
+  p+
+    theme_bw(base_size=20)+
+    theme(
+      legend.position="none",
+
+      axis.text.x = element_text(size=24),
+      axis.text.y = element_text(size=24),
+      axis.title  = element_text(size=26, face="bold"),
+
+      # Override theme_bw() defaults for facet labels. 
+      # Explicitly defining strip.text.x and strip.text.y ensures 
+      # that Markdown is rendered correctly in both orientat
+      strip.text   = ggtext::element_markdown(size=24, face="bold"),
+      strip.text.x = ggtext::element_markdown(size=24, face="bold"),
+      strip.text.y = ggtext::element_markdown(size=24, face="bold", angle = -90)
+
+    )+
+    labs(
+      x=xlabel,
+      y=ylabel
+    )
+
+}
+
+# --- Treatment colours ---
+# treatment_colors <- c(
+#   "Abs:Abs" = adjust_ltc(ploen, amount = -25, which = c(3, 4))[4],
+#   "Prs:Abs"    = ltc("ploen")[1], 
+#   "Abs:Prs"    = adjust_ltc(ploen, amount = +25, which = c(3, 4))[5], 
+#   "Prs:Prs"   = adjust_ltc(ploen, amount = -25, which = c(3, 4))[3]  
+# )
+
+treatment_colors <- c(
+  "Abs:Abs" = ltc("alger")[1],
+  "Prs:Abs"    = ltc("alger")[2], 
+  "Abs:Prs"    = ltc("alger")[5], 
+  "Prs:Prs"   = ltc("alger")[4]
+)
+
+
+
+# --- design ---
+design <- read.csv("design.csv")
+
+# --- Import and prepare bin data ---
+bins <- read.csv("all_Lab_bins.csv")
+
+bins <- bins %>%
+  mutate(ID = str_extract(Image, "^\\d+"))
+
+design <- design %>%
+  mutate(ID = as.character(ID))
+
+bins <- bins %>%
+  left_join(design,
+            by="ID")
+
+bins %>%
+  dplyr::select(Image, ID, MicB, MicP) %>%
+  distinct()
+
+# --- Plot all leaves ---
+bins_plot <- bins %>%
+  mutate(Interaction = interaction(MicB, MicP, sep = ":"))
+
+p_L <- plot_histogram(
+    data = bins_plot %>% filter(Channel == "L"),
+    xlabel = "L* bin",
+    facet_var = "MicP",
+    treatment_colors = treatment_colors,
+    treatment_labels = c(MicB = "*T. asperellum*", MicP = "*R. solani*"),
+    level_labels = c(Prs = "+", Abs = "-")
+  )
+p_a <- plot_histogram(
+    data = bins_plot %>% filter(Channel == "a"),
+    xlabel = "a* bin",
+    facet_var = "MicP",
+    treatment_colors = treatment_colors,
+    treatment_labels = c(MicB = "*T. asperellum*", MicP = "*R. solani*"),
+    level_labels = c(Prs = "+", Abs = "-")
+  )
+p_b <- plot_histogram(
+    data = bins_plot %>% filter(Channel == "b"),
+    xlabel = "b* bin",
+    facet_var = "MicP",
+    treatment_colors = treatment_colors, 
+    treatment_labels = c(MicB = "*T. asperellum*", MicP = "*R. solani*"),
+    level_labels = c(Prs = "+", Abs = "-")
+  )
+
+ggsave(
+  filename = "Results/Plots/all_leaves_L.pdf",
+  plot = p_L,
+  width = 26,
+  height = 20
+)
+
+ggsave(
+  filename = "Results/Plots/all_leaves_a.pdf",
+  plot = p_a,
+  width = 26,
+  height = 20
+)
+
+ggsave(
+  filename = "Results/Plots/all_leaves_b.pdf",
+  plot = p_b,
+  width = 26,
+  height = 20
+)
+
+# --- leafmax plots ---
+bins_leafmax <- bins_plot %>%
+  mutate(leaf_number = as.numeric(str_extract(Leaf,"\\d+"))) %>%
+  group_by(ID) %>%
+  filter(leaf_number == max(leaf_number)) %>%
+  ungroup()
+
+p_L <- plot_histogram(
+    data = bins_leafmax %>% filter(Channel == "L"),
+    xlabel = "L* bin",
+    facet_var = "MicB",
+    treatment_colors = treatment_colors,
+    treatment_labels = c(MicB = "*T. asperellum*", MicP = "*R. solani*"),
+    level_labels = c(Prs = "+", Abs = "-")
+  )
+p_a <- plot_histogram(
+    data = bins_leafmax %>% filter(Channel == "a"),
+    xlabel = "a* bin",
+    facet_var = "MicB",
+    treatment_colors = treatment_colors,
+    treatment_labels = c(MicB = "*T. asperellum*", MicP = "*R. solani*"),
+    level_labels = c(Prs = "+", Abs = "-")
+  )
+p_b <- plot_histogram(
+    data = bins_leafmax %>% filter(Channel == "b"),
+    xlabel = "b* bin",
+    facet_var = "MicB",
+    treatment_colors = treatment_colors, 
+    treatment_labels = c(MicB = "*T. asperellum*", MicP = "*R. solani*"),
+    level_labels = c(Prs = "+", Abs = "-")
+  )
+
+ggsave(
+  filename = "Results/Plots/6_leaves_L.pdf",
+  plot = p_L,
+  width = 26,
+  height = 20
+)
+
+ggsave(
+  filename = "Results/Plots/6_leaves_L_text.pdf",
+  plot = p_L,
+  width = 14,
+  height = 10
+)
+
+ggsave(
+  filename = "Results/Plots/6_leaves_a.pdf",
+  plot = p_a,
+  width = 26,
+  height = 20
+)
+
+
+ggsave(
+  filename = "Results/Plots/6_leaves_a_text.pdf",
+  plot = p_L,
+  width = 14,
+  height = 10
+)
+
+ggsave(
+  filename = "Results/Plots/6_leaves_b.pdf",
+  plot = p_b,
+  width = 26,
+  height = 20
+)
+
+ggsave(
+  filename = "Results/Plots/6_leaves_b_text.pdf",
+  plot = p_L,
+  width = 14,
+  height = 10
+)
+
+# --- Combine L*, a*, and b* plots ---
+p <- (p_a | p_b) / p_L
+
+ggsave(
+  filename = "Results/Plots/6_leaves_Lab_text.pdf",
+  plot = p,
+  width = 14,
+  height = 16
+)
+
+# --- Average pseudo-replicates ---
+bins_mean <- bins_leafmax %>%
+    mutate(
+    ID = as.numeric(ID),
+    Replicate = ceiling(ID/2)
+  ) %>%
+  group_by(
+    Replicate,
+    Batch,
+    MicB,
+    MicP,
+    Interaction,
+    Channel,
+    Bin
+  ) %>%
+  summarise(
+    Count = mean(Count),
+    .groups = "drop"
+  ) %>%
+  rename(ID = Replicate) %>%
+  group_by(ID, Batch, MicB, MicP, Interaction, Channel) %>%
+  mutate(
+    Prop = Count / sum(Count)
+  ) %>%
+  ungroup()
+
+p_L <- plot_histogram(
+    data = bins_mean %>% filter(Channel == "L"),
+    xlabel = "L* bin",
+    facet_var = "MicB",
+    treatment_colors = treatment_colors,
+    treatment_labels = c(MicB = "*T. asperellum*", MicP = "*R. solani*"),
+    level_labels = c(Prs = "+", Abs = "-")
+  )
+p_a <- plot_histogram(
+    data = bins_mean %>% filter(Channel == "a"),
+    xlabel = "a* bin",
+    facet_var = "MicB",
+    treatment_colors = treatment_colors,
+    treatment_labels = c(MicB = "*T. asperellum*", MicP = "*R. solani*"),
+    level_labels = c(Prs = "+", Abs = "-")
+  )
+p_b <- plot_histogram(
+    data = bins_mean %>% filter(Channel == "b"),
+    xlabel = "b* bin",
+    facet_var = "MicB",
+    treatment_colors = treatment_colors, 
+    treatment_labels = c(MicB = "*T. asperellum*", MicP = "*R. solani*"),
+    level_labels = c(Prs = "+", Abs = "-")
+  )
+
+ggsave(
+  filename = "Results/Plots/6_leaves_mean_Lab_text.pdf",
+  plot = p,
+  width = 26,
+  height = 20
+)
+
+ggsave(
+  filename = "Results/Plots/6_leaves_mean_L.pdf",
+  plot = p_L,
+  width = 26,
+  height = 20
+)
+
+ggsave(
+  filename = "Results/Plots/6_leaves_mean_a.pdf",
+  plot = p_a,
+  width = 26,
+  height = 20
+)
+
+# --- Combine L*, a*, and b* plots ---
+p <- (p_a | p_b) / p_L
+
+ggsave(
+  filename = "Results/Plots/6_leaves_mean_b.pdf",
+  plot = p_b,
+  width = 14,
+  height = 16
+)
+```
+
+```{r}   
+# ==========================================================
+# functions
+# =========================================================
+
+# Extract the numerical leaf identifier from the "Leaf" column
+extract_leaf_number <- function(data){
+  data %>%
+    mutate(
+      leaf_number = as.numeric(
+        stringr::str_extract(Leaf,"\\d+")
+      )
+    )
+}
+
+# link experimental design metadata to each image
+add_design <- function(data, design){
+  data %>%
+    mutate(
+      ID = stringr::str_extract(Image,"^\\d+")
+    ) %>%
+    left_join(
+      design %>% mutate(ID=as.character(ID)),
+      by="ID"
+    ) %>%
+    mutate(
+      Interaction = paste(MicB, MicP, sep=":")
+    )
+}
+
+# Select the highest-numbered leaf (here: correspond to "All segmented leaves" image) for each replicate
+select_leafmax <- function(data,
+                           group_vars=c("ID")){
+  data %>%
+    extract_leaf_number() %>%
+    group_by(across(all_of(group_vars))) %>%
+    filter(
+      leaf_number == max(leaf_number)
+    ) %>%
+    ungroup()
+}
+
+# Normalize pixel histograms to relative frequencies
+normalize_histogram <- function(data){
+  data %>%
+    group_by(
+      Batch,
+      Image,
+      Leaf,
+      Channel
+    ) %>%
+    mutate(
+      Prop = Count / sum(Count)
+    ) %>%
+    ungroup()
+}
+
+# Convert 8-bit histogram bins back to original 32-bit Lab scale
+#
+# Reminder: Fiji macro export Lab histograms transformed in 256 bins (8-bit conversion). 
+# Subsequently, orignal minimul and maximum values were recorded in Lab_ranges.csv and used to transformed  back 256 bins -> Lab values.
+#
+# Lab_value = (min + Bin) / (255 * (max - min))
+convert_bins_to_lab <- function(data, ranges){
+  ranges <- ranges %>%
+    mutate(
+      values = stringr::str_extract(Header,"\\[.*\\]"),
+      values = stringr::str_extract_all(
+        values,
+        "-?[0-9]+\\.?[0-9]*"
+      ),
+      min = purrr::map_dbl(values, ~as.numeric(.x[1])),
+      max = purrr::map_dbl(values, ~as.numeric(.x[2]))
+    ) %>%
+    dplyr::select(
+      Batch,
+      Image,
+      Leaf,
+      Channel,
+      min,
+      max
+    )
+
+  data %>%
+    left_join(
+      ranges,
+      by=c(
+        "Batch",
+        "Image",
+        "Leaf",
+        "Channel"
+      )
+    ) %>%
+    mutate(
+      Lab_value =
+        min + Bin/255*(max-min)
+    )
+}
+
+# Compute weighted mean Lab values from the normalized histograms.
+# Idea : Each Lab values is weighted by its pixels counts -> decrease length biais.
+compute_mean_Lab <- function(data){
+  data %>%
+    group_by(
+      ID,
+      MicB,
+      MicP,
+      Interaction,
+      Channel
+    ) %>%
+    summarise(
+      Mean =
+        weighted.mean(
+          Lab_value,
+          Count
+        ),
+      .groups="drop"
+    )
+}
+
+to_CIELAB <- function(data){
+  data %>%
+    pivot_wider(
+      names_from=Channel,
+      values_from=Mean
+    )
+}
+
+# Compute pairwise CIEDE2000 colo differences between treatment groups.
+# Mean L*, a* and b* values are computed for each treatment.
+# Then the pairwise colour differences of the mean/individual values per treatment is compute.  
+compute_deltaE <- function(data,
+                           group="Interaction",
+                           aggregate=TRUE){
+  if(aggregate){
+    color <- data %>%
+      group_by(.data[[group]]) %>%
+      summarise(
+        L=mean(L, na.rm=TRUE),
+        a=mean(a, na.rm=TRUE),
+        b=mean(b, na.rm=TRUE),
+        .groups="drop"
+      )
+
+  } else {
+    color <- data
+  }
+
+  lab <- color[, c("L", "a", "b")] %>%
+    as.matrix()
+  mat <- farver::compare_colour(
+    from=lab,
+    to=lab,
+    from_space="lab",
+    method="CIE2000"
+  )
+
+  if(aggregate){
+    rownames(mat) <- color[[group]]
+    colnames(mat) <- color[[group]]
+
+  } else {
+    rownames(mat) <- color$ID
+    colnames(mat) <- color$ID
+  }
+
+  mat
+}
+
+# Halved pariwise correlation matrix
+plotdE <- function(deltaE_matrix,
+                    legend_title = "Delta color",
+                    level_labels  = NULL,   # ex: c(Prs = "+", Abs = "-")
+                    factor_labels = NULL    # ex: c("*T. asp*", "*R. sol*") - ordre positionnel, markdown ok
+){
+  deltaE_matrix <- as.matrix(deltaE_matrix)
+  rownames(deltaE_matrix) <- make.unique(
+    rownames(deltaE_matrix)
+  )
+  colnames(deltaE_matrix) <- make.unique(
+    colnames(deltaE_matrix)
+  )
+  n <- nrow(deltaE_matrix)
+
+  # --- Force the scale to start at 0 ---
+  lims <- c(0, max(deltaE_matrix, na.rm = TRUE))
+
+  df_long <- expand.grid(
+    row = seq_len(n),
+    col = seq_len(n)
+  )
+  df_long$DeltaE <- deltaE_matrix[
+    cbind(
+      df_long$row,
+      df_long$col
+    )
+  ]
+  # Upper triangle only
+  df_long$DeltaE[
+    df_long$row >= df_long$col
+  ] <- NA
+  df_long$From <- factor(
+    rownames(deltaE_matrix)[df_long$row],
+    levels = rownames(deltaE_matrix)
+  )
+  df_long$To <- factor(
+    colnames(deltaE_matrix)[df_long$col],
+    levels = colnames(deltaE_matrix)
+  )
+  from_levels_used <- levels(df_long$From)[-n]
+  to_levels_used   <- levels(df_long$To)[-1]
+  df_long <- df_long %>%
+    dplyr::filter(!is.na(DeltaE))
+  df_long$From <- factor(
+    as.character(df_long$From),
+    levels = from_levels_used
+  )
+  df_long$To <- factor(
+    as.character(df_long$To),
+    levels = to_levels_used
+  )
+
+  # --- Helper: replace each factor level and add positional prefixes ---
+  apply_level_label <- function(x) {
+  sapply(as.character(x), function(x) {
+  # Detect and remove optional ID suffix
+  has_ID <- grepl("_[0-9]+$", x)
+
+  if (has_ID) {
+    ID <- sub("^.*_([0-9]+)$", "\\1", x)
+    x <- sub("_[0-9]+$", "", x)
+  }
+  parts <- strsplit(x, ":")[[1]]
+  # Replace levels individually (Prs -> +, Abs -> -)
+  if (!is.null(level_labels)) {
+    parts <- ifelse(parts %in% names(level_labels), level_labels[parts], parts)
+  }
+  # Positional prefix
+  if (!is.null(factor_labels)) {
+    parts <- paste0(parts, factor_labels[seq_along(parts)],
+      ifelse(is.na(factor_labels[seq_along(parts)]), "", " "))
+  }
+  result <- paste(parts, collapse = "  ×  ")
+  # Add ID only when it exists
+  if (has_ID) {
+    result <- paste0(result, " [", ID, "]")
+  }
+  result
+  })
+  }
+
+  # --- Display labels (do not replace the internal factor levels) ---
+  from_labels_display <- setNames(
+    apply_level_label(from_levels_used),
+    from_levels_used
+  )
+  to_labels_display <- setNames(
+    apply_level_label(to_levels_used),
+    to_levels_used
+  )
+
+  ggplot(
+    df_long,
+    aes(
+      x = From,
+      y = To,
+      fill = DeltaE
+    )
+  ) +
+    geom_tile(
+      color = "white",
+      linewidth = 0.8
+    ) +
+    geom_text(
+      aes(
+        label = round(
+          DeltaE,
+          2
+        )
+      ),
+      color = "black",
+      size = 22             # --- size increase for pwp ---
+    ) +
+    scale_fill_gradientn(
+      colours = c(
+        #"white",
+        ltc("alger")[2],
+        ltc("alger")[4]
+        
+      ),
+      limits = lims,
+      na.value = "transparent"
+    ) +
+    guides(
+     fill = guide_colourbar(
+        title.position = "top",
+        title.hjust = 0.5,
+        barwidth = unit(1.5, "cm"),
+        barheight = unit(12, "cm")
+      )
+    ) +
+    scale_x_discrete(
+      limits = from_levels_used,
+      labels = unname(from_labels_display[from_levels_used]),   # --- Force ordering ---
+      expand = c(0, 0)
+    ) +
+    scale_y_discrete(
+      limits = rev(to_levels_used),
+      labels = unname(to_labels_display[rev(to_levels_used)]),  # --- Force ordering ---
+      expand = c(0, 0)
+    ) +
+    coord_fixed() +
+    theme_bw(base_size = 20) +        # --- Base font size increased ---
+    theme(
+      axis.title = element_blank(),
+      panel.grid = element_blank(),
+      panel.border = element_blank(),
+      axis.ticks = element_blank(),
+      axis.text.x = ggtext::element_markdown(           # --- Italic Markdown labels ---
+        angle = 45,
+        hjust = 1,
+        size = 48
+      ),
+      axis.text.y = ggtext::element_markdown(            # --- Italic Markdown labels ---
+        size = 48
+      ),
+      legend.position = "right",
+      legend.title = element_text(size = 40, face = "bold"),
+      legend.text  = element_text(size = 32),
+      legend.margin = margin(0, 0, 0, 0),
+      legend.box.margin = margin(0, 0, 0, 0),
+      plot.margin = margin(5, 5, 5, 5)
+    ) +
+    labs(fill = legend_title)
+}
+
+save_deltaE <- function(res,
+                        plot,
+                        prefix,
+                        width = 26,
+                        height = 20){
+  ggsave(
+    paste0("Results/Plots/", prefix, ".pdf"),
+    plot,
+    width = width,
+    height = height,
+    limitsize = FALSE
+  )
+
+  write.csv(
+    res,
+    paste0("Results/Tables/LAB_", prefix, ".csv"),
+    row.names = FALSE
+  )
+}
+
+# ============================================================
+# Main analysis
+# ============================================================
+bins <- read.csv("all_Lab_bins.csv")
+design <- read.csv("design.csv")
+ranges <- read.csv("Lab_ranges.csv")
+
+bins <- bins %>%
+  add_design(design) %>%
+  select_leafmax("ID") %>%
+  normalize_histogram() %>%
+  convert_bins_to_lab(ranges)
+
+mean_Lab <- bins %>%
+  compute_mean_Lab() %>%
+  to_CIELAB()
+
+# Calculate individual-image CIELAB values
+Lab_ind <- bins %>%
+  group_by(ID, MicB, MicP, Interaction, Channel) %>%
+  summarise(
+    value = weighted.mean(Lab_value, Count),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = Channel,
+    values_from = value
+  )
+
+Lab_ind
+
+# --- treatment mean pairwise comparaison
+deltaE <- compute_deltaE(Lab_ind, aggregate = TRUE)
+
+#TODO : intervertir [2]:[3] ; [,2]:[,3]
+
+new_order <- c("Abs:Abs", "Prs:Abs", "Abs:Prs", "Prs:Prs")
+
+deltaE2 <- deltaE[new_order, new_order]
+
+plotdE(deltaE2)
+
+p_mean <- plotdE(deltaE2, legend_title = "delta color",  level_labels  = c(Prs = "+", Abs = "-"), factor_labels = c("*T. asp*", "*R. sol*"))
+
+save_deltaE( Lab_ind, p_mean, "exp2_means")
+
+# --- Individual pairwise comparaison
+deltaE <- compute_deltaE(Lab_ind, aggregate = FALSE)
+
+ids <- paste(Lab_ind$Interaction, Lab_ind$ID, sep = "_")
+
+rownames(deltaE) <- ids
+colnames(deltaE) <- ids
+
+p_day <- plotdE(deltaE, legend_title = "delta color",  level_labels  = c(Prs = "+", Abs = "-"), factor_labels = c("*T. asp*", "*R. sol*"))
+
+#TODO: fix Latex R_sol labels
+save_deltaE( Lab_ind, p_day, "exp2_day", width = 320, height = 160)
+
+Lab_rep <- Lab_ind %>%
+  mutate(Replicate = ceiling(as.numeric(ID) / 2)) %>%
+  group_by(Replicate, MicB, MicP, Interaction) %>%
+  summarise(
+    L = mean(L),
+    a = mean(a),
+    b = mean(b),
+    .groups = "drop"
+  ) %>%
+  rename(ID = Replicate)
+
+Lab_SD <- Lab_rep %>%
+  group_by(Interaction) %>%
+  summarise(
+    n = n(),
+    L_mean = mean(L),
+    L_sd   = sd(L),
+
+    a_mean = mean(a),
+    a_sd   = sd(a),
+
+    b_mean = mean(b),
+    b_sd   = sd(b),
+
+    .groups = "drop"
+  )
+
+Lab_SD
+
+# ============================================================
+# Generate formatted CIELAB summary tables
+# ============================================================
+LabTable <- function(
+    df,
+    out_dir = "Results",
+    rep_id,
+    treatment_labels = c(
+      MicB = "*T.asperellum*",
+      MicP = "*R.solani*"
+    ),
+    level_labels = c(
+      Prs = "+",
+      Abs = "-"
+    )
+){
+
+  # --- 1. Create treatment labels 
+  df <- df %>%
+    tidyr::separate(
+      Interaction,
+      into = c("MicB", "MicP"),
+      sep = ":",
+      remove = FALSE
+    ) %>%
+    mutate(
+      Treatment = paste0(
+        level_labels[MicB], "",
+        treatment_labels["MicB"],
+        "\\ × ",
+        level_labels[MicP], "",
+        treatment_labels["MicP"]
+      )
+    )
+
+  # --- 2. Formatting 
+  df <- df %>%
+    mutate(
+      across(
+        where(is.numeric),
+        ~ signif(., 3)
+      )
+    ) %>%
+    mutate(
+      across(
+        everything(),
+        ~ ifelse(is.na(.) | . == "", "-", .)
+      )
+    )
+
+  # --- 3. Select + rename 
+  df <- df %>%
+    dplyr::select(
+      Treatment,
+      n,
+      L_mean, L_sd,
+      a_mean, a_sd,
+      b_mean, b_sd
+    ) %>%
+      rename(
+        "Treatment" = Treatment,
+        "n" = n,
+        "L_mean" = L_mean,
+        "L_SD" = L_sd,
+        "a_mean" = a_mean,
+        "a_SD" = a_sd,
+        "b_mean" = b_mean,
+        "b_SD" = b_sd
+      )
+
+  # --- 4. Table 
+  tbl <- tt(
+    df,
+    cols = tidyselect::everything(),
+    rownames = FALSE,
+    escape = FALSE
+  ) |>
+    tt_header_above(c(
+      " " = 2,
+      "*L\\**" = 2,
+      "*a\\**" = 2,
+      "*b\\**" = 2
+    )) |>
+    tt_column("Treatment", width = "25%") |>
+    tt_column("n", width = "6%")
+
+  # --- 5. Export 
+  dir.create(
+    out_dir,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+
+  typ_file <- file.path(
+    out_dir,
+    paste0("Lab_", rep_id, ".typ")
+  )
+
+  pdf_file <- file.path(
+    out_dir,
+    paste0("Lab_", rep_id, ".pdf")
+  )
+
+  writeLines(
+    capture.output(print(tbl)),
+    typ_file
+  )
+
+  system(
+    paste(
+      "typst compile",
+      typ_file,
+      pdf_file
+    )
+  )
+
+  return(tbl)
+}
+
+LabTable(
+  Lab_SD,
+  rep_id = "Lab",
+  treatment_labels = c(
+    MicB = "_T.asperellum_",
+    MicP = "_R.solani_"
+  ),
+  level_labels = c(
+    Prs = "+",
+    Abs = "-"
+  )
+)
+```
+
